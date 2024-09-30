@@ -1,0 +1,244 @@
+---
+title: "Productivity Snapshot"
+author: "Greg Lenane"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{=html}
+<style type="text/css">
+.main-container {
+  max-width: 1800px;
+  margin-left: auto;
+  margin-right: auto;
+}
+</style>
+```
+
+```{r libraries constants, include=F}
+library(dplyr)
+library(dbplyr)
+library(tidyr)
+library(odbc)
+library(DBI)
+library(kableExtra)
+library(lubridate)
+library(scales)
+library(janitor)
+library(ggplot2)
+
+# OAO Production dsn
+prod_dsn <- "OAO Cloud DB Production"
+
+# GP1C CT path
+data_dir <- paste0("/SharedDrive/deans/Presidents/SixSigma/MSHS Productivity/",
+                   "Productivity/Analysis/MSH CVI GP1C_SEPT2024/")
+
+# get date at time of script execution
+today <- Sys.Date()
+
+# CT tech life numbers
+CT_life <- read.csv(paste0(data_dir, "/snapshot_data/ct_life.csv"), 
+                    header = F) %>%
+  select(V1) %>%
+  mutate(V1 = as.character(V1)) %>%
+  pull()
+
+# CT cost center
+CT_dep <- "12618"
+
+# CT EPIC ID
+CT_epic <- "8006027"
+
+# target WHpU
+target <- 1.3059
+```
+
+```{r dates, include=F}
+# connect to OAO_PROD
+con_prod <- dbConnect(odbc(), prod_dsn)
+
+# get list of historic distribution pps
+paycycle <- tbl(con_prod, "LPM_MAPPING_PAYCYCLE") %>%
+  filter(PREMIER_DISTRIBUTION == 1,
+         PP_END_DATE < to_date(today, "YYYY:MM:DD")) %>%
+  select(PP_START_DATE, PP_END_DATE) %>%
+  distinct() %>%
+  arrange(desc(PP_START_DATE)) %>%
+  show_query() %>%
+  collect() 
+  
+
+# get end date of upcomming distribution
+end_date <- as.Date(paycycle[2, 2] %>% pull())
+
+# get start date for snapshot (26 pay periods)
+start_date <- tbl(con_prod, "LPM_MAPPING_PAYCYCLE") %>% 
+  filter(PP_END_DATE <= to_date(end_date, "YYYY:MM:DD")) %>%
+  select(PP_START_DATE, PP_END_DATE) %>%
+  distinct() %>%
+  arrange(desc(PP_START_DATE)) %>%
+  collect() %>%
+  mutate(index = row_number()) %>%
+  filter(index == 26) %>%
+  select(PP_START_DATE) %>%
+  pull()
+
+# if start date is before first pp of Epic data then reset to 2024-05-05
+if (start_date <= as.Date("2024-05-05")) {
+  start_date <- as.Date("2024-05-05")
+}
+
+# get pp end date of start date
+start_date_pp <- start_date + 13
+```
+
+## Employee Roster
+<div style="margin-bottom:50px;">
+```{r employee roster, echo=FALSE, message=F}
+# connect to OAO_PROD
+con_prod <- dbConnect(odbc(), prod_dsn)
+
+# get labor data
+labor <- tbl(con_prod, "LPM_MAPPED_MSHS_ORACLE") %>%
+  filter(EMPLOYEE_ID %in% CT_life,
+         PP_END_DATE >= as.Date(start_date),
+         PP_END_DATE <= as.Date(end_date),
+         WORKED_PAYCODE == 1,
+         INCLUDE_HOURS == 1,
+         WD_DEPARTMENT == CT_dep) %>%
+  group_by(WORKED_DEPARTMENT, WORKED_DEPARTMENT_NAME, EMPLOYEE_ID, 
+           EMPLOYEE_NAME, POSITION_CODE_DESCRIPTION, PP_END_DATE) %>%
+  summarise(WORKED_HOURS = sum(WD_HOURS, na.rm = TRUE),
+            FTE = sum(WD_HOURS, na.rm = TRUE)/75) %>%
+  arrange(PP_END_DATE) %>%
+  collect() 
+
+# transform labor data into employee roster
+roster <- labor %>%
+  pivot_wider(id_cols = c(WORKED_DEPARTMENT, WORKED_DEPARTMENT_NAME,
+                          EMPLOYEE_ID, EMPLOYEE_NAME,
+                          POSITION_CODE_DESCRIPTION),
+              names_from = PP_END_DATE,
+              values_from = WORKED_HOURS) %>%
+  mutate(across(where(is.numeric), ~ format(round(.x, digits = 2), nsmall = 2)))
+
+roster[roster == "NA"] <- ""
+
+# print kable of employee roster
+roster %>%
+  kable(format = "html", escape = F) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+</div>
+
+## Productivity Table
+<div style="margin-bottom:50px;">
+```{r productivity table, echo=FALSE, message=F}
+# connect to OAO_PROD
+con_prod <- dbConnect(odbc(), prod_dsn)
+
+# get GP1C CT volume
+volume <- tbl(con_prod, "MV_DM_PATIENT_ACCESS") %>%
+  filter(DEPARTMENT_ID == CT_epic,
+         APPT_DTTM >= as.Date(start_date),
+         APPT_DTTM <= as.Date(end_date),
+         DERIVED_STATUS_DESC == "Arrived") %>%
+  collect() %>%
+  mutate(APPT_DTTM = as.Date(APPT_DTTM)) %>%
+  left_join(tbl(con_prod, "LPM_MAPPING_PAYCYCLE") %>% collect(), 
+            by = c("APPT_DTTM" = "PAYCYCLE_DATE")) %>%
+  group_by(PP_START_DATE, PP_END_DATE, DEPARTMENT_NAME, DEPARTMENT_ID) %>%
+  summarise(VISITS = n())
+
+# create tidy productivity table
+productivity_tidy <- labor %>%
+  group_by(PP_END_DATE) %>%
+  summarise(WORKED_HOURS = sum(WORKED_HOURS, na.rm = TRUE),
+            FTE = sum(FTE, na.rm = TRUE)) %>%
+  left_join(volume, by = c("PP_END_DATE" = "PP_END_DATE")) %>%
+  mutate(WHpU = WORKED_HOURS/VISITS,
+         PRODUCTIVITY_INDEX_decimal = target/WHpU,
+         TARGET_FTE = VISITS * target / 75,
+         FTE_VARIANCE = FTE - TARGET_FTE,
+         UPPER = 110,
+         LOWER = 95,
+         TARGET = 100)
+
+# create productivity table for output
+productivity_table <- productivity_tidy %>%
+  mutate(FTE = round(FTE, digits = 2),
+         WHpU = round(WHpU, digits = 4),
+         PRODUCTIVITY_INDEX = label_percent()(PRODUCTIVITY_INDEX_decimal),
+         TARGET_FTE = round(TARGET_FTE, digits = 2),
+         FTE_VARIANCE = round(FTE_VARIANCE, digits = 2)) %>%
+  select(PP_END_DATE, WORKED_HOURS, FTE, VISITS, WHpU, PRODUCTIVITY_INDEX,
+         TARGET_FTE, FTE_VARIANCE) %>%
+  t() %>%
+  as.data.frame() %>%
+  row_to_names(row_number = 1) %>%
+  mutate(METRIC = row.names(.), .before = as.character(start_date_pp))
+
+rownames(productivity_table) <- NULL
+
+# print kable of productivity table
+productivity_table %>%
+  relocate(METRIC) %>%
+  mutate(across(
+    2:ncol(productivity_table),
+    ~ cell_spec(.x,
+                color = ifelse(METRIC == "PRODUCTIVITY_INDEX" &
+                                 as.numeric(substr(.x, 1, nchar(.x) - 1)) > 110, "black",
+                               ifelse(METRIC == "PRODUCTIVITY_INDEX" &
+                                        as.numeric(substr(.x, 1, nchar(.x) - 1)) < 95, "white", "black")),
+                
+                background = ifelse(METRIC == "PRODUCTIVITY_INDEX" &
+                                      as.numeric(substr(.x, 1, nchar(.x) - 1)) > 110, "yellow",
+                                    ifelse(METRIC == "PRODUCTIVITY_INDEX" &
+                                             as.numeric(substr(.x, 1, nchar(.x) - 1)) < 95, "red", "white"))))) %>%
+  kable(format = "html", escape = F) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"))
+```
+</div>
+
+## Productivity Index
+<div style="margin-bottom:50px;">
+```{r productivity index, echo=FALSE, message=F, warning=F, fig.dim=c(12,5), fig.align='center'}
+g <- ggplot(productivity_tidy, aes(x = PP_END_DATE, 
+                                   y = PRODUCTIVITY_INDEX_decimal,
+                                   label = percent(PRODUCTIVITY_INDEX_decimal))) + 
+  geom_hline(yintercept = 1, color = "dark green", linewidth = 1.2) +
+  geom_hline(yintercept = 1.1, color = "yellow", linewidth = 1.2) +
+  geom_hline(yintercept = .95, color = "red", linewidth = 1.2) +
+  geom_line(color = "blue", linewidth = 1.2) + 
+  geom_label(nudge_y = .015) +
+  geom_point(color = "blue", size = 3) +
+  scale_x_datetime(date_labels = "%Y-%m-%d", breaks = productivity_tidy$PP_END_DATE) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Productivity Index Graph",
+       x = "Pay Period End Date",
+       y = "Productivity Index") +
+  theme(plot.title = element_text(hjust = 0.5))
+g
+```
+</div>
+
+## Staffing To Volume
+<div style="margin-bottom:50px;">
+```{r staffing to volume, echo=FALSE, message=F, warning=F, fig.dim=c(12,5), fig.align='center'}
+scale_factor = mean(productivity_tidy$VISITS)/mean(productivity_tidy$WORKED_HOURS)
+
+g <- ggplot(productivity_tidy, aes(x = PP_END_DATE)) + 
+  geom_col(aes(y = WORKED_HOURS), color = "deepskyblue", fill = "deepskyblue") + 
+  geom_line(aes(y = VISITS/scale_factor), color = "blue", linewidth = 3) +
+  scale_y_continuous(
+    name = "Worked Hours",
+    sec.axis = sec_axis(trans=~.*scale_factor, name="Visits")
+  ) +
+  scale_x_datetime(date_labels = "%Y-%m-%d", breaks = productivity_tidy$PP_END_DATE) +
+  labs(title = "Staffing To Volume",
+       x = "Pay Period End Date") +
+  theme(plot.title = element_text(hjust = 0.5))
+g
+```
+</div>
