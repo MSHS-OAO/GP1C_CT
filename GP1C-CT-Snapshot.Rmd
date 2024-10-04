@@ -226,18 +226,21 @@ g
 ## Staffing To Volume
 <div style="margin-bottom:50px;">
 ```{r staffing to volume, echo=FALSE, message=F, warning=F, fig.dim=c(12,5), fig.align='center'}
-scale_factor = mean(productivity_tidy$VISITS)/mean(productivity_tidy$WORKED_HOURS)
+scale_factor = mean(productivity_tidy$WORKED_HOURS)/mean(productivity_tidy$VISITS)
+color = c("Worked Hours" = "blue", "Visits" = "deepskyblue")
 
 g <- ggplot(productivity_tidy, aes(x = PP_END_DATE)) + 
-  geom_col(aes(y = WORKED_HOURS), color = "deepskyblue", fill = "deepskyblue") + 
-  geom_line(aes(y = VISITS/scale_factor), color = "blue", linewidth = 3) +
+  geom_col(aes(y = VISITS, color = "Visits"), fill = "deepskyblue") + 
+  geom_line(aes(y = WORKED_HOURS/scale_factor, color = "Worked Hours", fill = "Worked Hours"), linewidth = 3) +
   scale_y_continuous(
-    name = "Worked Hours",
-    sec.axis = sec_axis(trans=~.*scale_factor, name="Visits")
+    name = "Visits",
+    sec.axis = sec_axis(trans=~.*scale_factor, name="Worked Hours")
   ) +
   scale_x_datetime(date_labels = "%Y-%m-%d", breaks = productivity_tidy$PP_END_DATE) +
   labs(title = "Staffing To Volume",
-       x = "Pay Period End Date") +
+       x = "Pay Period End Date",
+       color = "Legend") +
+  scale_color_manual(values = color) +
   theme(plot.title = element_text(hjust = 0.5))
 g
 ```
